@@ -1024,4 +1024,12 @@ util.buf_get_full_text = function(bufnr)
   return text
 end
 
+--- Determines the indentation level of a line.
+---@param line string
+---@return number
+util.get_indentation_level = function(line)
+  local _, num_spaces = string.gsub(line, "^%s+", "")
+  return num_spaces
+end
+
 return util

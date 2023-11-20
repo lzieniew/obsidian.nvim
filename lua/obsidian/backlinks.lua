@@ -84,8 +84,6 @@ end
 ---
 ---@return BacklinkMatch[]
 Backlinks._gather = function(self)
-  ---@param match_data MatchData
-  ---@return boolean
   local is_valid_backlink = function(match_data)
     local line = match_data.lines.text
     for _, submatch in pairs(match_data.submatches) do
@@ -98,48 +96,151 @@ Backlinks._gather = function(self)
     return false
   end
 
-  local backlink_matches = {}
-  local last_path = nil
-  local last_note = nil
+  local backlink_data = {}
   local tx, rx = channel.oneshot()
-
   search.search_async(self.client.dir, "[[" .. tostring(self.note.id), { "--fixed-strings" }, function(match)
     if is_valid_backlink(match) then
-      local path = match.path.text
-      local src_note
-      if path ~= last_path then
-        src_note = Note.from_file(path, self.client.dir)
-      else
-        assert(last_note ~= nil)
-        src_note = last_note
-      end
-      table.insert(
-        backlink_matches,
-        { note = src_note, line = match.line_number, text = string.gsub(match.lines.text, "\n", "") }
-      )
-      last_path = path
-      last_note = src_note
+      table.insert(backlink_data, { path = match.path.text, line_number = match.line_number })
     end
   end, function(_, _, _)
     tx()
   end)
-
   rx()
+
+  local backlink_matches = {}
+  for _, data in ipairs(backlink_data) do
+    local src_note = Note.from_file(data.path, self.client.dir)
+    table.insert(backlink_matches, {
+      note = src_note,
+      line = data.line_number,
+    })
+  end
 
   return backlink_matches
 end
+Backlinks._view = function(self, backlink_matches)
+  -- Clear any existing backlinks buffer.
+  wipe_rogue_buffer()
 
----Create a view for the backlinks.
-Backlinks.view = function(self)
-  async.run(function()
-    return self:_gather()
-  end, function(backlink_matches)
-    vim.schedule(function()
-      self:_view(backlink_matches)
-    end)
-  end)
+  vim.api.nvim_command("botright " .. tostring(self.client.opts.backlinks.height) .. "split ObsidianBacklinks")
+
+  -- Configure buffer.
+  vim.cmd "setlocal nonu"
+  vim.cmd "setlocal nornu"
+  vim.cmd "setlocal winfixheight"
+  vim.api.nvim_buf_set_option(0, "filetype", "ObsidianBacklinks")
+  vim.api.nvim_buf_set_option(0, "buftype", "nofile")
+  vim.api.nvim_buf_set_option(0, "swapfile", false)
+  vim.api.nvim_buf_set_option(0, "buflisted", false)
+  vim.api.nvim_buf_set_var(0, "obsidian_vault_dir", tostring(self.client:vault_root()))
+  vim.api.nvim_buf_set_var(0, "obsidian_parent_win", self.winnr)
+  vim.api.nvim_win_set_option(0, "wrap", self.client.opts.backlinks.wrap)
+  vim.api.nvim_win_set_option(0, "spell", false)
+  vim.api.nvim_win_set_option(0, "list", false)
+  vim.api.nvim_win_set_option(0, "signcolumn", "no")
+  vim.api.nvim_win_set_option(0, "foldmethod", "manual")
+  vim.api.nvim_win_set_option(0, "foldcolumn", "0")
+  vim.api.nvim_win_set_option(0, "foldlevel", 3)
+  vim.api.nvim_win_set_option(0, "foldenable", false)
+
+  vim.api.nvim_buf_set_keymap(
+    0,
+    "n",
+    "<CR>",
+    [[<cmd>lua require("obsidian.backlinks").open()<CR>]],
+    { silent = true, noremap = true, nowait = true }
+  )
+
+  vim.wo.foldtext = [[v:lua.require("obsidian.backlinks").foldtext()]]
+
+  vim.api.nvim_buf_set_option(0, "readonly", false)
+  vim.api.nvim_buf_set_option(0, "modifiable", true)
+  vim.api.nvim_buf_clear_namespace(0, self.client.backlinks_namespace, 0, -1)
+
+  -- Render lines.
+  local view_lines = {}
+  local highlights = {}
+  local folds = {}
+  local last_path = nil
+  local matches_for_note = 0
+  for _, match in pairs(backlink_matches) do
+    -- Header for note.
+    if match.note.path ~= last_path then
+      if last_path ~= nil then
+        table.insert(folds, { range = { #view_lines - matches_for_note, #view_lines } })
+        table.insert(view_lines, "")
+      end
+      matches_for_note = 0
+      table.insert(view_lines, (" %s"):format(match.note:display_name()))
+      table.insert(highlights, { group = "CursorLineNr", line = #view_lines - 1, col_start = 0, col_end = 1 })
+      table.insert(highlights, { group = "Directory", line = #view_lines - 1, col_start = 2, col_end = -1 })
+    end
+
+    local line_content = vim.api.nvim_buf_get_lines(0, match.line - 1, match.line, false)[1]
+    if line_content then
+      local context_lines = {}
+      local line_number = match.line + 1
+      while true do
+        local line = vim.api.nvim_buf_get_lines(0, line_number - 1, line_number, false)[1]
+        if not line or string.find(line, "^%s*$") then
+          break
+        end
+        table.insert(context_lines, line)
+        line_number = line_number + 1
+      end
+
+      local text, ref_indices, ref_strs = util.find_and_replace_refs(line_content)
+      local display_path = assert(self.client:vault_relative_path(match.note.path))
+      local text_start = 4 + display_path:len() + tostring(match.line):len()
+      table.insert(view_lines, ("  %s:%s:%s"):format(display_path, match.line, text))
+
+      -- Add highlights for all refs in the text.
+      for i, ref_idx in ipairs(ref_indices) do
+        local ref_str = ref_strs[i]
+        if string.find(ref_str, tostring(self.note.id), 1, true) ~= nil then
+          table.insert(highlights, {
+            group = "Search",
+            line = #view_lines - 1,
+            col_start = text_start + ref_idx[1] - 1,
+            col_end = text_start + ref_idx[2],
+          })
+        end
+      end
+
+      -- Add highlight for path and line number
+      table.insert(highlights, {
+        group = "Comment",
+        line = #view_lines - 1,
+        col_start = 2,
+        col_end = text_start,
+      })
+
+      for _, context_line in ipairs(context_lines) do
+        table.insert(view_lines, ("    %s"):format(context_line))
+      end
+    end
+
+    last_path = match.note.path
+    matches_for_note = matches_for_note + 1
+  end
+  table.insert(folds, { range = { #view_lines - matches_for_note, #view_lines } })
+
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, view_lines)
+
+  -- Render highlights.
+  for _, hl in pairs(highlights) do
+    vim.api.nvim_buf_add_highlight(0, self.client.backlinks_namespace, hl.group, hl.line, hl.col_start, hl.col_end)
+  end
+
+  -- Create folds.
+  for _, fold in pairs(folds) do
+    vim.api.nvim_cmd({ range = fold.range, cmd = "fold" }, {})
+  end
+
+  -- Lock the buffer.
+  vim.api.nvim_buf_set_option(0, "readonly", true)
+  vim.api.nvim_buf_set_option(0, "modifiable", false)
 end
-
 ---@param backlink_matches BacklinkMatch[]
 Backlinks._view = function(self, backlink_matches)
   -- Clear any existing backlinks buffer.
@@ -199,32 +300,49 @@ Backlinks._view = function(self, backlink_matches)
       table.insert(highlights, { group = "Directory", line = #view_lines - 1, col_start = 2, col_end = -1 })
     end
 
-    -- Line for backlink within note.
-    local display_path = assert(self.client:vault_relative_path(match.note.path))
-    local text, ref_indices, ref_strs = util.find_and_replace_refs(match.text)
-    local text_start = 4 + display_path:len() + tostring(match.line):len()
-    table.insert(view_lines, ("  %s:%s:%s"):format(display_path, match.line, text))
+    local line_content = vim.api.nvim_buf_get_lines(0, match.line - 1, match.line, false)[1]
+    if line_content then
+      local context_lines = {}
+      local line_number = match.line + 1
+      while true do
+        local line = vim.api.nvim_buf_get_lines(0, line_number - 1, line_number, false)[1]
+        if not line or string.find(line, "^%s*$") then
+          break
+        end
+        table.insert(context_lines, line)
+        line_number = line_number + 1
+      end
 
-    -- Add highlights for all refs in the text.
-    for i, ref_idx in ipairs(ref_indices) do
-      local ref_str = ref_strs[i]
-      if string.find(ref_str, tostring(self.note.id), 1, true) ~= nil then
-        table.insert(highlights, {
-          group = "Search",
-          line = #view_lines - 1,
-          col_start = text_start + ref_idx[1] - 1,
-          col_end = text_start + ref_idx[2],
-        })
+      local text, ref_indices, ref_strs = util.find_and_replace_refs(line_content)
+      local display_path = assert(self.client:vault_relative_path(match.note.path))
+      local text_start = 4 + display_path:len() + tostring(match.line):len()
+      table.insert(view_lines, ("  %s:%s:%s"):format(display_path, match.line, text))
+
+      -- Add highlights for all refs in the text.
+      for i, ref_idx in ipairs(ref_indices) do
+        local ref_str = ref_strs[i]
+        if string.find(ref_str, tostring(self.note.id), 1, true) ~= nil then
+          table.insert(highlights, {
+            group = "Search",
+            line = #view_lines - 1,
+            col_start = text_start + ref_idx[1] - 1,
+            col_end = text_start + ref_idx[2],
+          })
+        end
+      end
+
+      -- Add highlight for path and line number
+      table.insert(highlights, {
+        group = "Comment",
+        line = #view_lines - 1,
+        col_start = 2,
+        col_end = text_start,
+      })
+
+      for _, context_line in ipairs(context_lines) do
+        table.insert(view_lines, ("    %s"):format(context_line))
       end
     end
-
-    -- Add highlight for path and line number
-    table.insert(highlights, {
-      group = "Comment",
-      line = #view_lines - 1,
-      col_start = 2,
-      col_end = text_start,
-    })
 
     last_path = match.note.path
     matches_for_note = matches_for_note + 1
@@ -247,7 +365,6 @@ Backlinks._view = function(self, backlink_matches)
   vim.api.nvim_buf_set_option(0, "readonly", true)
   vim.api.nvim_buf_set_option(0, "modifiable", false)
 end
-
 Backlinks.open = function()
   local vault_dir = Path:new(vim.api.nvim_buf_get_var(0, "obsidian_vault_dir"))
   local parent_win = vim.api.nvim_buf_get_var(0, "obsidian_parent_win")
